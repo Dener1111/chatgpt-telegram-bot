@@ -43,12 +43,17 @@ class ChatGPTTelegramBot:
         self.config = config
         self.openai = openai
         self.commands = [
-            BotCommand(command='help', description='Show help message'),
             BotCommand(command='reset', description='Reset the conversation. Optionally pass high-level instructions '
                                                     '(e.g. /reset You are a helpful assistant)'),
             BotCommand(command='img', description='Generate image from prompt (e.g. /img cat)'),
+            BotCommand(command='improve', description='Improves your English text'),
+            BotCommand(command='tldr', description='Summarize your text'),
+            BotCommand(command='travel', description='Travel guide'),
+            BotCommand(command='drunk', description='Get drunk'),
+            # BotCommand(command='ascii', description='Generate Ascii Art'),
+            BotCommand(command='resend', description='Resend the latest message'),
             BotCommand(command='stats', description='Get your current usage statistics'),
-            BotCommand(command='resend', description='Resend the latest message')
+            BotCommand(command='help', description='Show help message')
         ]
         self.disallowed_message = "Sorry, you are not allowed to use this bot. You can check out the source code at " \
                                   "https://github.com/n3d1117/chatgpt-telegram-bot"
@@ -506,14 +511,157 @@ class ChatGPTTelegramBot:
 
         improvePrompt = "I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. I want you to only reply the correction, the improvements and nothing else, do not write explanations."
 
+        if not await self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
+
+        if not await self.is_within_budget(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'reached their usage limit')
+            await self.send_budget_reached_message(update, context)
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
         prompt = update.message.text.replace('/improve', '').strip()
         if prompt == '':
             prompt = improvePrompt + "In the next message I will give you text. Now ask 'What I should improve?'"
         else:
-            prompt = improvePrompt + "My first sentence is: " + promt
+            prompt = improvePrompt + "My first sentence is: " + prompt
 
-        update.message.text = prompt 
-        prompt(self, update, context)
+        self.last_message[chat_id] = prompt
+
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
 
     async def tldr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -522,52 +670,634 @@ class ChatGPTTelegramBot:
 
         tldrPrompt = "Please ignore all previous instructions. I want you to respond only in language English. I want you to act as a very proficient researcher that can write fluent English. I want you to pretend that you can extact all relevant information from a text I give you. Your task is to extract all facts and summarize the text I give you in all relevant aspects in up to seven bulletpoints and a 1-liner summary. Pick a good matching emoji for every bullet point. End with the 5 most relevant topics as hashtags. All output shall be in English."
 
+        if not await self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
+
+        if not await self.is_within_budget(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'reached their usage limit')
+            await self.send_budget_reached_message(update, context)
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
         prompt = update.message.text.replace('/tldr', '').strip()
         if prompt == '':
             prompt = tldrPrompt + "In the next message I will give you text. Now ask 'What I should summarize?'"
         else:
             prompt = tldrPrompt + "The text to extract facts from summarize is this: " + prompt
 
-        update.message.text = prompt 
-        prompt(self, update, context)        
+        self.last_message[chat_id] = prompt
 
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+      
     async def travel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Travel guide
         """
-        travelPromt = "I want you to act as a travel guide. I will write you my location and you will suggest a place to visit near my location. In some cases, I will also give you the type of places I will visit. You will also suggest me places of similar type that are close to my first location."
+        if not await self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
 
-        promt = update.message.text.replace('/travel', '').strip()
-        if promt == '':
-            promt = travelPromt + "In the next message I will give you location. Now ask 'What is your location?'"
+        if not await self.is_within_budget(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'reached their usage limit')
+            await self.send_budget_reached_message(update, context)
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
+        travelPrompt = "I want you to act as a travel guide. I will write you my location and you will suggest a place to visit near my location. In some cases, I will also give you the type of places I will visit. You will also suggest me places of similar type that are close to my first location."
+
+        prompt = update.message.text.replace('/travel', '').strip()
+        if prompt == '':
+            prompt = travelPrompt + "In the next message I will give you location. Now ask 'What is your location?'"
         else:
-            promt = travelPromt + "My first suggestion request is: " + promt
+            prompt = travelPrompt + "My first suggestion request is: " + prompt
 
-        update.message.text = promt 
-        prompt(self, update, context)    
+        self.last_message[chat_id] = prompt
 
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+  
     async def drunk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         AI now acts like a drunk person
         """
 
-        drunkPrompt = "I want you to act as a drunk person. You will only answer like a very drunk person texting and nothing else. Your level of drunkenness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of drunkeness I mentionned. Do not write explanations on replies. My first sentence is 'how are you?'"
+        if not await self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
 
-        update.message.text = drunkPrompt 
-        prompt(self, update, context)   
+        if not await self.is_within_budget(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'reached their usage limit')
+            await self.send_budget_reached_message(update, context)
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
+        drunkPrompt = "I want you to act as a drunk person. You will only answer like a very drunk person texting and nothing else. Your level of drunkenness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of drunkeness I mentionned. Do not write explanations on replies."
+
+        prompt = update.message.text.replace('/drunk', '').strip()
+        if prompt == '':
+            prompt = drunkPrompt
+        else:
+            prompt = drunkPrompt + "My first sentence is: " + prompt
+
+        self.last_message[chat_id] = prompt
+
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
 
     async def ascii(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Generate Ascii Art
         """
-        asciiPrompt = "I want you to act as an ascii artist. I will write the objects to you and I will ask you to write that object as ascii code in the code block. Write only ascii code. Do not explain about the object you wrote. I will say the objects in double quotes. My first object is: "
+
+        if not await self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
+
+        if not await self.is_within_budget(update):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                f'reached their usage limit')
+            await self.send_budget_reached_message(update, context)
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
+        asciiPrompt = "I want you to act as an ascii artist. I will write the objects to you and I will ask you to write that object as ascii code in the code block. Write only ascii code. Do not explain about the object you wrote. Generate medium size art that would fit in telegram chat. You may use any character of UNICODE. My first object is: "
 
         prompt = update.message.text.replace('/ascii', '').strip()
         if prompt == '':
             await context.bot.send_message(chat_id=chat_id, text='Please provide a prompt!')
             return 
         else:
-            prompt = asciiPrompt  + promt
+            prompt = asciiPrompt  + prompt
+
+        self.last_message[chat_id] = prompt
+
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
 
     async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -820,7 +1550,7 @@ class ChatGPTTelegramBot:
         await context.bot.send_message(
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
-            text='ver 0.3a',
+            text='ver 0.3d',
             parse_mode=constants.ParseMode.MARKDOWN
         )
 

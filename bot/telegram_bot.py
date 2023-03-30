@@ -46,7 +46,7 @@ class ChatGPTTelegramBot:
             BotCommand(command='help', description='Show help message'),
             BotCommand(command='reset', description='Reset the conversation. Optionally pass high-level instructions '
                                                     '(e.g. /reset You are a helpful assistant)'),
-            BotCommand(command='image', description='Generate image from prompt (e.g. /image cat)'),
+            BotCommand(command='img', description='Generate image from prompt (e.g. /img cat)'),
             BotCommand(command='stats', description='Get your current usage statistics'),
             BotCommand(command='resend', description='Resend the latest message')
         ]
@@ -69,7 +69,6 @@ class ChatGPTTelegramBot:
                     '\n\n' + \
                     "Open source at https://github.com/n3d1117/chatgpt-telegram-bot"
         await update.message.reply_text(help_text, disable_web_page_preview=True)
-
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -188,7 +187,7 @@ class ChatGPTTelegramBot:
         chat_id = update.effective_chat.id
         image_query = message_text(update.message)
         if image_query == '':
-            await context.bot.send_message(chat_id=chat_id, text='Please provide a prompt! (e.g. /image cat)')
+            await context.bot.send_message(chat_id=chat_id, text='Please provide a prompt! (e.g. /img cat)')
             return
 
         logging.info(f'New image generation request received from user {update.message.from_user.name} '
@@ -500,6 +499,76 @@ class ChatGPTTelegramBot:
                 parse_mode=constants.ParseMode.MARKDOWN
             )
 
+    async def improve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Spelling corrector and improver.
+        """
+
+        improvePrompt = "I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. I want you to only reply the correction, the improvements and nothing else, do not write explanations."
+
+        prompt = update.message.text.replace('/improve', '').strip()
+        if prompt == '':
+            prompt = improvePrompt + "In the next message I will give you text. Now ask 'What I should improve?'"
+        else:
+            prompt = improvePrompt + "My first sentence is: " + promt
+
+        update.message.text = prompt 
+        prompt(self, update, context)
+
+    async def tldr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Summarize the text.
+        """
+
+        tldrPrompt = "Please ignore all previous instructions. I want you to respond only in language English. I want you to act as a very proficient researcher that can write fluent English. I want you to pretend that you can extact all relevant information from a text I give you. Your task is to extract all facts and summarize the text I give you in all relevant aspects in up to seven bulletpoints and a 1-liner summary. Pick a good matching emoji for every bullet point. End with the 5 most relevant topics as hashtags. All output shall be in English."
+
+        prompt = update.message.text.replace('/tldr', '').strip()
+        if prompt == '':
+            prompt = tldrPrompt + "In the next message I will give you text. Now ask 'What I should summarize?'"
+        else:
+            prompt = tldrPrompt + "The text to extract facts from summarize is this: " + prompt
+
+        update.message.text = prompt 
+        prompt(self, update, context)        
+
+    async def travel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Travel guide
+        """
+        travelPromt = "I want you to act as a travel guide. I will write you my location and you will suggest a place to visit near my location. In some cases, I will also give you the type of places I will visit. You will also suggest me places of similar type that are close to my first location."
+
+        promt = update.message.text.replace('/travel', '').strip()
+        if promt == '':
+            promt = travelPromt + "In the next message I will give you location. Now ask 'What is your location?'"
+        else:
+            promt = travelPromt + "My first suggestion request is: " + promt
+
+        update.message.text = promt 
+        prompt(self, update, context)    
+
+    async def drunk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        AI now acts like a drunk person
+        """
+
+        drunkPrompt = "I want you to act as a drunk person. You will only answer like a very drunk person texting and nothing else. Your level of drunkenness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of drunkeness I mentionned. Do not write explanations on replies. My first sentence is 'how are you?'"
+
+        update.message.text = drunkPrompt 
+        prompt(self, update, context)   
+
+    async def ascii(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Generate Ascii Art
+        """
+        asciiPrompt = "I want you to act as an ascii artist. I will write the objects to you and I will ask you to write that object as ascii code in the code block. Write only ascii code. Do not explain about the object you wrote. I will say the objects in double quotes. My first object is: "
+
+        prompt = update.message.text.replace('/ascii', '').strip()
+        if prompt == '':
+            await context.bot.send_message(chat_id=chat_id, text='Please provide a prompt!')
+            return 
+        else:
+            prompt = asciiPrompt  + promt
+
     async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Handle the inline query. This is run when you type: @botusername <query>
@@ -736,6 +805,25 @@ class ChatGPTTelegramBot:
         """
         await application.bot.set_my_commands(self.commands)
 
+    async def ver(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Check version
+        """
+        if not self.is_allowed(update):
+            logging.warning(f'User {update.message.from_user.name} is not allowed to use the bot')
+            await self.send_disallowed_message(update, context)
+            return
+
+        logging.info(f'New message received from user {update.message.from_user.name}')
+        chat_id = update.effective_chat.id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=update.message.message_id,
+            text='ver 0.3a',
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
+
     def run(self):
         """
         Runs the bot indefinitely until the user presses Ctrl+C
@@ -749,11 +837,17 @@ class ChatGPTTelegramBot:
             .build()
 
         application.add_handler(CommandHandler('reset', self.reset))
-        application.add_handler(CommandHandler('help', self.help))
-        application.add_handler(CommandHandler('image', self.image))
-        application.add_handler(CommandHandler('start', self.help))
-        application.add_handler(CommandHandler('stats', self.stats))
+        application.add_handler(CommandHandler('img', self.image))
+        application.add_handler(CommandHandler('improve', self.improve))
+        application.add_handler(CommandHandler('tldr', self.tldr))
+        application.add_handler(CommandHandler('travel', self.travel))
+        application.add_handler(CommandHandler('drunk', self.drunk))
+        application.add_handler(CommandHandler('ascii', self.ascii))
         application.add_handler(CommandHandler('resend', self.resend))
+        application.add_handler(CommandHandler('stats', self.stats))
+        application.add_handler(CommandHandler('help', self.help))
+        application.add_handler(CommandHandler('ver', self.ver))
+        application.add_handler(CommandHandler('start', self.help))
         application.add_handler(MessageHandler(
             filters.AUDIO | filters.VOICE | filters.Document.AUDIO |
             filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO,

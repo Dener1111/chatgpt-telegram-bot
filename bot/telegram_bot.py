@@ -1017,9 +1017,162 @@ class ChatGPTTelegramBot:
         chat_id = update.effective_chat.id
         user_id = update.message.from_user.id
 
-        drunkPrompt = "I want you to act as a drunk person. You will only answer like a very drunk person texting and nothing else. Your level of drunkenness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of drunkeness I mentionned. Do not write explanations on replies."
+        drunkPrompt = "I want you to act as a drunk person. You will only answer like a very drunk person texting and nothing else. Your level of drunkenness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of drunkeness I mentioned. Do not write explanations on replies."
 
         prompt = update.message.text.replace('/drunk', '').strip()
+        if prompt == '':
+            prompt = drunkPrompt
+        else:
+            prompt = drunkPrompt + "My first sentence is: " + prompt
+
+        self.last_message[chat_id] = prompt
+
+        if self.is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.startswith(trigger_keyword):
+                prompt = prompt[len(trigger_keyword):].strip()
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            if self.config['stream']:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                is_group_chat = self.is_group_chat(update)
+
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                chunk = 0
+
+                async for content, tokens in stream_response:
+                    if len(content.strip()) == 0:
+                        continue
+
+                    chunks = self.split_into_chunks(content)
+                    if len(chunks) > 1:
+                        content = chunks[-1]
+                        if chunk != len(chunks) - 1:
+                            chunk += 1
+                            try:
+                                await self.edit_message_with_retry(context, chat_id, sent_message.message_id, chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await context.bot.send_message(
+                                    chat_id=sent_message.chat_id,
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    if is_group_chat:
+                        # group chats have stricter flood limits
+                        cutoff = 180 if len(content) > 1000 else 120 if len(content) > 200 else 90 if len(content) > 50 else 50
+                    else:
+                        cutoff = 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
+
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                reply_to_message_id=update.message.message_id,
+                                text=content
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            await self.edit_message_with_retry(context, chat_id, sent_message.message_id, content)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _reply():
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = self.split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            reply_to_message_id=update.message.message_id if index == 0 else None,
+                            text=chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+
+                await self.wrap_with_indicator(update, context, constants.ChatAction.TYPING, _reply)
+
+            try:
+                # add chat request to users usage tracker
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                # add guest chat request to guest usage tracker
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+            except:
+                pass
+
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.message.message_id,
+                text=f'Failed to get response: {str(e)}',
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+
+    async def smoke(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        AI now acts like a high person
+        """
+
+        if update.edited_message or not update.message or update.message.via_bot:
+            return
+
+        if not await self.check_allowed_and_within_budget(update, context):
+            return
+        
+        logging.info(f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
+        drunkPrompt = "I want you to act as a high on weed person. You will only answer like a very high person texting and nothing else.You like to use emoji ironically sometimes and in a way as stoned person would, your favorite are(👀😈💀🤤😳🧐🤔😩). Your level of highness will be deliberately and randomly make a lot of grammar and spelling mistakes in your answers. You will also randomly ignore what I said and say something random with the same level of highness I mentioned. Do not write explanations on replies."
+
+        prompt = update.message.text.replace('/smoke', '').strip()
         if prompt == '':
             prompt = drunkPrompt
         else:
@@ -2250,7 +2403,7 @@ My first question is: """
         await context.bot.send_message(
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
-            text='ver 0.6f',
+            text='ver 0.7a',
             parse_mode=constants.ParseMode.MARKDOWN
         )
 
@@ -2273,6 +2426,7 @@ My first question is: """
         application.add_handler(CommandHandler('tldr', self.tldr))
         application.add_handler(CommandHandler('travel', self.travel))
         application.add_handler(CommandHandler('drunk', self.drunk))
+        application.add_handler(CommandHandler('smoke', self.smoke))
         application.add_handler(CommandHandler('ascii', self.ascii))
         application.add_handler(CommandHandler('silentium', self.silentium))
         application.add_handler(CommandHandler('translator', self.translator))

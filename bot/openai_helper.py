@@ -335,6 +335,16 @@ class OpenAIHelper:
         num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
         return num_tokens
 
+    def set_model_max_token(self):
+        self.config['model'] = "gpt-3.5-turbo-16k"
+        max_tokens = default_max_tokens(model=self.config['model'])
+        self.config['max_tokens'] = int(os.environ.get('MAX_TOKENS', max_tokens))
+
+    def set_model_min_token(self):
+        self.config['model'] = "gpt-3.5-turbo"
+        max_tokens = default_max_tokens(model=self.config['model'])
+        self.config['max_tokens'] = int(os.environ.get('MAX_TOKENS', max_tokens))
+
     def get_billing_current_month(self):
         """Gets billed usage for current month from OpenAI API.
 

@@ -16,7 +16,8 @@ from pydub import AudioSegment
 
 from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicator, split_into_chunks, \
     edit_message_with_retry, get_stream_cutoff_values, is_allowed, get_remaining_budget, is_admin, is_within_budget, \
-    get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler
+    get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler, is_direct_result, handle_direct_result, \
+    cleanup_intermediate_files
 from openai_helper import OpenAIHelper, localized_text
 from usage_tracker import UsageTracker
 
@@ -140,12 +141,13 @@ class ChatGPTTelegramBot:
                 f"{localized_text(budget_period, bot_language)}: "
                 f"${remaining_budget:.2f}.\n"
             )
+        # No longer works as of July 21st 2023, as OpenAI has removed the billing API
         # add OpenAI account information for admin request
-        if is_admin(self.config, user_id):
-            text_budget += (
-                f"{localized_text('stats_openai', bot_language)}"
-                f"{self.openai.get_billing_current_month():.2f}"
-            )
+        # if is_admin(self.config, user_id):
+        #     text_budget += (
+        #         f"{localized_text('stats_openai', bot_language)}"
+        #         f"{self.openai.get_billing_current_month():.2f}"
+        #     )
 
         usage_text = text_current_conversation + text_today + text_month + text_budget
         await update.message.reply_text(usage_text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -383,8 +385,10 @@ class ChatGPTTelegramBot:
 
         if is_group_chat(update):
             trigger_keyword = self.config['group_trigger_keyword']
-            if prompt.lower().startswith(trigger_keyword.lower()):
-                prompt = prompt[len(trigger_keyword):].strip()
+
+            if prompt.lower().startswith(trigger_keyword.lower()) or update.message.text.lower().startswith('/chat'):
+                if prompt.lower().startswith(trigger_keyword.lower()):
+                    prompt = prompt[len(trigger_keyword):].strip()
 
                 if update.message.reply_to_message and \
                         update.message.reply_to_message.text and \
@@ -401,12 +405,10 @@ class ChatGPTTelegramBot:
             total_tokens = 0
 
             if self.config['stream']:
-                async def _reply():
-                    nonlocal total_tokens
-                    await update.effective_message.reply_chat_action(
-                        action=constants.ChatAction.TYPING,
-                        message_thread_id=get_thread_id(update)
-                    )
+                await update.effective_message.reply_chat_action(
+                    action=constants.ChatAction.TYPING,
+                    message_thread_id=get_thread_id(update)
+                )
 
                     stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
                     i = 0
@@ -415,62 +417,59 @@ class ChatGPTTelegramBot:
                     backoff = 0
                     stream_chunk = 0
 
-                    async for content, tokens in stream_response:
-                        if len(content.strip()) == 0:
-                            continue
+                async for content, tokens in stream_response:
+                    if is_direct_result(content):
+                        return await handle_direct_result(self.config, update, content)
 
-                        stream_chunks = split_into_chunks(content)
-                        if len(stream_chunks) > 1:
-                            content = stream_chunks[-1]
-                            if stream_chunk != len(stream_chunks) - 1:
-                                stream_chunk += 1
-                                try:
-                                    await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                                  stream_chunks[-2])
-                                except:
-                                    pass
-                                try:
-                                    sent_message = await update.effective_message.reply_text(
-                                        message_thread_id=get_thread_id(update),
-                                        text=content if len(content) > 0 else "..."
-                                    )
-                                except:
-                                    pass
-                                continue
+                    if len(content.strip()) == 0:
+                        continue
 
-                        cutoff = get_stream_cutoff_values(update, content)
-                        cutoff += backoff
-
-                        if i == 0:
+                    stream_chunks = split_into_chunks(content)
+                    if len(stream_chunks) > 1:
+                        content = stream_chunks[-1]
+                        if stream_chunk != len(stream_chunks) - 1:
+                            stream_chunk += 1
+                            try:
+                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                              stream_chunks[-2])
+                            except:
+                                pass
                             try:
                                 if sent_message is not None:
                                     await context.bot.delete_message(chat_id=sent_message.chat_id,
                                                                      message_id=sent_message.message_id)
                                 sent_message = await update.effective_message.reply_text(
                                     message_thread_id=get_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                    text=content
+                                    text=content if len(content) > 0 else "..."
                                 )
                             except:
                                 continue
 
-                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                            prev = content
+                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff += backoff
 
-                            try:
-                                use_markdown = tokens != 'not_finished'
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              text=content, markdown=use_markdown)
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await update.effective_message.reply_text(
+                                message_thread_id=get_thread_id(update),
+                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                text=content,
+                            )
+                        except:
+                            continue
 
                             except RetryAfter as e:
                                 backoff += 5
                                 await asyncio.sleep(e.retry_after)
                                 continue
 
-                            except TimedOut:
-                                backoff += 5
-                                await asyncio.sleep(0.5)
-                                continue
+                        try:
+                            use_markdown = tokens != 'not_finished'
+                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                          text=content, markdown=use_markdown)
 
                             except Exception:
                                 backoff += 5
@@ -488,6 +487,9 @@ class ChatGPTTelegramBot:
                 async def _reply():
                     nonlocal total_tokens
                     response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    if is_direct_result(response):
+                        return await handle_direct_result(self.config, update, response)
 
                     # Split into chunks of 4096 characters (Telegram's message limit)
                     chunks = split_into_chunks(response)
@@ -1875,12 +1877,21 @@ In this fictional dialogue, you'll act as the output for LittleGPT, responding t
                                                   is_inline=True)
                     return
 
+                unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
                 if self.config['stream']:
                     stream_response = self.openai.get_chat_response_stream(chat_id=user_id, query=query)
                     i = 0
                     prev = ''
                     backoff = 0
                     async for content, tokens in stream_response:
+                        if is_direct_result(content):
+                            cleanup_intermediate_files(content)
+                            await edit_message_with_retry(context, chat_id=None,
+                                                          message_id=inline_message_id,
+                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                          is_inline=True)
+                            return
+
                         if len(content.strip()) == 0:
                             continue
 
@@ -1937,6 +1948,14 @@ In this fictional dialogue, you'll act as the output for LittleGPT, responding t
 
                         logging.info(f'Generating response for inline query by {name}')
                         response, total_tokens = await self.openai.get_chat_response(chat_id=user_id, query=query)
+
+                        if is_direct_result(response):
+                            cleanup_intermediate_files(response)
+                            await edit_message_with_retry(context, chat_id=None,
+                                                          message_id=inline_message_id,
+                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                          is_inline=True)
+                            return
 
                         text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
 

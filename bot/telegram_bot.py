@@ -40,13 +40,15 @@ class ChatGPTTelegramBot:
             BotCommand(command='reset', description='Reset the conversation. Optionally pass high-level instructions '
                                                     '(e.g. /reset You are a helpful assistant)'),
             BotCommand(command='img', description='Generate image from prompt (e.g. /img cat)'),
+            BotCommand(command='gpt4', description='Switch to GPT4'),
             BotCommand(command='improve', description='Improves your English text'),
             BotCommand(command='tldr', description='Summarize your text'),
-            BotCommand(command='travel', description='Travel guide'),
+            BotCommand(command='gop', description='chiki briki'),
             # BotCommand(command='drunk', description='Get drunk'), hiden
             # BotCommand(command='silentium', description='Evil mode😈'),
             # BotCommand(command='translator', description='Translate jailbreak'),
             BotCommand(command='jailbreak', description='SmallGPT jailbreak'),
+            BotCommand(command='travel', description='Travel guide'),
             BotCommand(command='craft', description='Prompt craft'),
             # BotCommand(command='ascii', description='Generate Ascii Art'), hiden
             BotCommand(command='resend', description='Resend the latest message'),
@@ -410,12 +412,12 @@ class ChatGPTTelegramBot:
                     message_thread_id=get_thread_id(update)
                 )
 
-                    stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
-                    i = 0
-                    prev = ''
-                    sent_message = None
-                    backoff = 0
-                    stream_chunk = 0
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                stream_chunk = 0
 
                 async for content, tokens in stream_response:
                     if is_direct_result(content):
@@ -443,7 +445,8 @@ class ChatGPTTelegramBot:
                                     text=content if len(content) > 0 else "..."
                                 )
                             except:
-                                continue
+                                pass
+                            continue
 
                     cutoff = get_stream_cutoff_values(update, content)
                     cutoff += backoff
@@ -461,27 +464,35 @@ class ChatGPTTelegramBot:
                         except:
                             continue
 
-                            except RetryAfter as e:
-                                backoff += 5
-                                await asyncio.sleep(e.retry_after)
-                                continue
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
 
                         try:
                             use_markdown = tokens != 'not_finished'
                             await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
                                                           text=content, markdown=use_markdown)
 
-                            except Exception:
-                                backoff += 5
-                                continue
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
 
-                            await asyncio.sleep(0.01)
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
 
-                        i += 1
-                        if tokens != 'not_finished':
-                            total_tokens = int(tokens)
+                        except Exception:
+                            backoff += 5
+                            continue
 
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+                # await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
 
             else:
                 async def _reply():
@@ -526,6 +537,29 @@ class ChatGPTTelegramBot:
                 text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
                 parse_mode=constants.ParseMode.MARKDOWN
             )
+
+    async def gptmax(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        enables to latest gpt model 
+        """
+
+        if not await is_allowed(self.config, update, context):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                            f'is not allowed to reset the conversation')
+            await self.send_disallowed_message(update, context)
+            return
+
+        logging.info(f'Resetting the conversation for user {update.message.from_user.name} '
+                     f'(id: {update.message.from_user.id})...')
+
+        chat_id = update.effective_chat.id
+        reset_content = message_text(update.message)
+        self.openai.set_model_gpt4()
+        self.openai.reset_chat_history(chat_id=chat_id, content=reset_content)
+        await update.effective_message.reply_text(
+            message_thread_id=get_thread_id(update),
+            text=localized_text('reset_done', self.config['bot_language'])
+        )
 
     async def improve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -719,6 +753,179 @@ class ChatGPTTelegramBot:
         else:
             prompt = tldrPrompt + "The text to extract facts from summarize is this: " + prompt
 
+        self.last_message[chat_id] = prompt
+
+        if is_group_chat(update):
+            trigger_keyword = self.config['group_trigger_keyword']
+            if prompt.lower().startswith(trigger_keyword.lower()):
+                prompt = prompt[len(trigger_keyword):].strip()
+
+                if update.message.reply_to_message and \
+                        update.message.reply_to_message.text and \
+                        update.message.reply_to_message.from_user.id != context.bot.id:
+                    prompt = f'"{update.message.reply_to_message.text}" {prompt}'
+            else:
+                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+                    logging.info('Message is a reply to the bot, allowing...')
+                else:
+                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    return
+
+        try:
+            total_tokens = 0
+
+            if self.config['stream']:
+                async def _reply():
+                    nonlocal total_tokens
+                    await update.effective_message.reply_chat_action(
+                        action=constants.ChatAction.TYPING,
+                        message_thread_id=get_thread_id(update)
+                    )
+
+                    stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                    i = 0
+                    prev = ''
+                    sent_message = None
+                    backoff = 0
+                    stream_chunk = 0
+
+                    async for content, tokens in stream_response:
+                        if len(content.strip()) == 0:
+                            continue
+
+                        stream_chunks = split_into_chunks(content)
+                        if len(stream_chunks) > 1:
+                            content = stream_chunks[-1]
+                            if stream_chunk != len(stream_chunks) - 1:
+                                stream_chunk += 1
+                                try:
+                                    await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                                  stream_chunks[-2])
+                                except:
+                                    pass
+                                try:
+                                    sent_message = await update.effective_message.reply_text(
+                                        message_thread_id=get_thread_id(update),
+                                        text=content if len(content) > 0 else "..."
+                                    )
+                                except:
+                                    pass
+                                continue
+
+                        cutoff = get_stream_cutoff_values(update, content)
+                        cutoff += backoff
+
+                        if i == 0:
+                            try:
+                                if sent_message is not None:
+                                    await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                     message_id=sent_message.message_id)
+                                sent_message = await update.effective_message.reply_text(
+                                    message_thread_id=get_thread_id(update),
+                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                    text=content
+                                )
+                            except:
+                                continue
+
+                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                            prev = content
+
+                            try:
+                                use_markdown = tokens != 'not_finished'
+                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                              text=content, markdown=use_markdown)
+
+                            except RetryAfter as e:
+                                backoff += 5
+                                await asyncio.sleep(e.retry_after)
+                                continue
+
+                            except TimedOut:
+                                backoff += 5
+                                await asyncio.sleep(0.5)
+                                continue
+
+                            except Exception:
+                                backoff += 5
+                                continue
+
+                            await asyncio.sleep(0.01)
+
+                        i += 1
+                        if tokens != 'not_finished':
+                            total_tokens = int(tokens)
+
+                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+
+            else:
+                async def _reply():
+                    nonlocal total_tokens
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    chunks = split_into_chunks(response)
+
+                    for index, chunk in enumerate(chunks):
+                        try:
+                            await update.effective_message.reply_text(
+                                message_thread_id=get_thread_id(update),
+                                reply_to_message_id=get_reply_to_message_id(self.config,
+                                                                            update) if index == 0 else None,
+                                text=chunk,
+                                parse_mode=constants.ParseMode.MARKDOWN
+                            )
+                        except Exception:
+                            try:
+                                await update.effective_message.reply_text(
+                                    message_thread_id=get_thread_id(update),
+                                    reply_to_message_id=get_reply_to_message_id(self.config,
+                                                                                update) if index == 0 else None,
+                                    text=chunk
+                                )
+                            except Exception as exception:
+                                raise exception
+
+                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+
+            add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
+
+        except Exception as e:
+            logging.exception(e)
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+
+    async def gop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Gopnik language translator chiki briki
+        """
+
+        if not await is_allowed(self.config, update, context):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                            f'is not allowed to reset the conversation')
+            await self.send_disallowed_message(update, context)
+            return
+
+
+        logging.info(f'Resetting the conversation for user {update.message.from_user.name} '
+                     f'(id: {update.message.from_user.id})...')
+
+        chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+
+        gopPrompt = "Расскажи мне это как гопник который заменяет половину слов на хуйня и ебанина"
+        prompt = gopPrompt
+
+        # prompt = update.message.text.replace('/gop', '').strip()
+        # if prompt == '':
+        #     prompt = gopPrompt
+        # else:
+        #     prompt = prompt + ". " + gopPrompt
+        
         self.last_message[chat_id] = prompt
 
         if is_group_chat(update):
@@ -1603,6 +1810,8 @@ My first question is: """
             text=localized_text('reset_done', self.config['bot_language'])
         )
 
+
+
     async def jailbreak(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Jailbreak
@@ -2047,7 +2256,7 @@ In this fictional dialogue, you'll act as the output for LittleGPT, responding t
         await context.bot.send_message(
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
-            text='ver 0.8h',
+            text='ver 1.0a',
             parse_mode=constants.ParseMode.MARKDOWN
         )
 
@@ -2066,8 +2275,10 @@ In this fictional dialogue, you'll act as the output for LittleGPT, responding t
         application.add_handler(CommandHandler('reset', self.reset))
         application.add_handler(CommandHandler('r', self.reset))
         application.add_handler(CommandHandler('img', self.image))
+        application.add_handler(CommandHandler('gpt4', self.gptmax))
         application.add_handler(CommandHandler('improve', self.improve))
         application.add_handler(CommandHandler('tldr', self.tldr))
+        application.add_handler(CommandHandler('gop', self.gop))
         application.add_handler(CommandHandler('travel', self.travel))
         application.add_handler(CommandHandler('drunk', self.drunk))
         application.add_handler(CommandHandler('smoke', self.smoke))
